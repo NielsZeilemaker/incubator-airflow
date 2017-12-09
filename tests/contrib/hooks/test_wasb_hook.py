@@ -19,7 +19,7 @@ import unittest
 
 from airflow import configuration
 from airflow import models
-from airflow.contrib.hooks.wasb_hook import WasbHook
+from airflow.contrib.hooks.wasb_hook import WasbHook, FileShareHook
 from airflow.utils import db
 
 try:
@@ -100,6 +100,28 @@ class TestWasbHook(unittest.TestCase):
 
     @mock.patch('airflow.contrib.hooks.wasb_hook.BlockBlobService',
                 autospec=True)
+    def test_get_blob_to_path(self, mock_service):
+        mock_instance = mock_service.return_value
+        hook = WasbHook(wasb_conn_id='wasb_test_sas_token')
+        hook.get_blob_to_path('container', 'blob', 'path',
+                              validate_content=False)
+        mock_instance.get_blob_to_path.assert_called_once_with(
+            'container', 'blob', 'path', validate_content=False
+        )
+
+    @mock.patch('airflow.contrib.hooks.wasb_hook.BlockBlobService',
+                autospec=True)
+    def test_get_blob_to_stream(self, mock_service):
+        mock_instance = mock_service.return_value
+        hook = WasbHook(wasb_conn_id='wasb_test_sas_token')
+        hook.get_blob_to_stream('container', 'blob',
+                                'file-like-object', validate_content=False)
+        mock_instance.get_blob_to_stream.assert_called_once_with(
+            'container', 'blob', 'file-like-object', validate_content=False
+        )
+
+    @mock.patch('airflow.contrib.hooks.wasb_hook.BlockBlobService',
+                autospec=True)
     def test_load_file(self, mock_service):
         mock_instance = mock_service.return_value
         hook = WasbHook(wasb_conn_id='wasb_test_sas_token')
@@ -116,6 +138,77 @@ class TestWasbHook(unittest.TestCase):
         hook.load_string('big string', 'container', 'blob', max_connections=1)
         mock_instance.create_blob_from_text.assert_called_once_with(
             'container', 'blob', 'big string', max_connections=1
+        )
+
+
+class TestFileShareHook(unittest.TestCase):
+
+    def setUp(self):
+        configuration.load_test_config()
+        db.merge_conn(
+            models.Connection(
+                conn_id='wasb_test_key', conn_type='wasb',
+                login='login', password='key'
+            )
+        )
+        db.merge_conn(
+            models.Connection(
+                conn_id='wasb_test_sas_token', conn_type='wasb',
+                login='login', extra=json.dumps({'sas_token': 'token'})
+            )
+        )
+
+    @mock.patch('airflow.contrib.hooks.wasb_hook.FileService',
+                autospec=True)
+    def test_check_for_file(self, mock_service):
+        mock_instance = mock_service.return_value
+        mock_instance.exists.return_value = True
+        hook = FileShareHook(wasb_conn_id='wasb_test_sas_token')
+        self.assertTrue(hook.check_for_file('share', 'directory', 'file', timeout=3))
+        mock_instance.exists.assert_called_once_with(
+            'share', 'directory', 'file', timeout=3
+        )
+
+    @mock.patch('airflow.contrib.hooks.wasb_hook.FileService',
+                autospec=True)
+    def test_get_file_to_path(self, mock_service):
+        mock_instance = mock_service.return_value
+        hook = WasbHook(wasb_conn_id='wasb_test_sas_token')
+        hook.get_file_to_path('share', 'directory', 'file', 'path',
+                              validate_content=False)
+        mock_instance.get_file_to_path.assert_called_once_with(
+            'share', 'directory', 'file', 'path', validate_content=False
+        )
+
+    @mock.patch('airflow.contrib.hooks.wasb_hook.FileService',
+                autospec=True)
+    def test_get_file_to_stream(self, mock_service):
+        mock_instance = mock_service.return_value
+        hook = WasbHook(wasb_conn_id='wasb_test_sas_token')
+        hook.get_file_to_stream('share', 'directory', 'file', 'file-like-object',
+                                validate_content=False)
+        mock_instance.get_file_to_stream.assert_called_once_with(
+            'share', 'directory', 'file', 'file-like-object', validate_content=False
+        )
+
+    @mock.patch('airflow.contrib.hooks.wasb_hook.FileService',
+                autospec=True)
+    def test_load_file(self, mock_service):
+        mock_instance = mock_service.return_value
+        hook = WasbHook(wasb_conn_id='wasb_test_sas_token')
+        hook.load_file('path', 'share', 'directory', 'file', max_connections=1)
+        mock_instance.create_file_from_path.assert_called_once_with(
+            'share', 'directory', 'file', 'path', max_connections=1
+        )
+
+    @mock.patch('airflow.contrib.hooks.wasb_hook.FileService',
+                autospec=True)
+    def test_load_string(self, mock_service):
+        mock_instance = mock_service.return_value
+        hook = WasbHook(wasb_conn_id='wasb_test_sas_token')
+        hook.load_string('big string', 'share', 'directory', 'file', max_connections=1)
+        mock_instance.create_file_from_text.assert_called_once_with(
+            'share', 'directory', 'file', 'big string', max_connections=1
         )
 
 
