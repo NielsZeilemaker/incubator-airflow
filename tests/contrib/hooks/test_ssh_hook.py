@@ -48,13 +48,13 @@ class SSHHookTest(unittest.TestCase):
         self.server_handle = subprocess.Popen(["python", "-c", HELLO_SERVER_CMD],
                                               stdout=subprocess.PIPE)
         print("Setting up tunnel")
-        with self.hook.create_tunnel(2135, 2134):
+        with self.hook.create_tunnel('127.0.0.1', 2134) as tunnel:
             print("Tunnel up")
             server_output = self.server_handle.stdout.read(5)
             self.assertEqual(server_output, b"ready")
             print("Connecting to server via tunnel")
             s = socket.socket()
-            s.connect(("localhost", 2135))
+            s.connect(("localhost", tunnel.local_bind_port))
             print("Receiving...", )
             response = s.recv(5)
             self.assertEqual(response, b"hello")

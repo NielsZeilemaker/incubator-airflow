@@ -19,6 +19,7 @@ import getpass
 import os
 
 import paramiko
+import sshtunnel
 
 from contextlib import contextmanager
 from airflow.exceptions import AirflowException
@@ -38,6 +39,8 @@ class SSHHook(BaseHook, LoggingMixin):
     :type ssh_conn_id: str
     :param remote_host: remote host to connect
     :type remote_host: str
+    :param remote_port: remote port to connect
+    :type remote_port: int
     :param username: username to connect to the remote_host
     :type username: str
     :param password: password of the username to connect to the remote_host
@@ -53,6 +56,7 @@ class SSHHook(BaseHook, LoggingMixin):
     def __init__(self,
                  ssh_conn_id=None,
                  remote_host=None,
+                 remote_port=None,
                  username=None,
                  password=None,
                  key_file=None,
@@ -62,6 +66,7 @@ class SSHHook(BaseHook, LoggingMixin):
         super(SSHHook, self).__init__(ssh_conn_id)
         self.ssh_conn_id = ssh_conn_id
         self.remote_host = remote_host
+        self.remote_port = remote_port
         self.username = username
         self.password = password
         self.key_file = key_file
@@ -70,57 +75,66 @@ class SSHHook(BaseHook, LoggingMixin):
         # Default values, overridable from Connection
         self.compress = True
         self.no_host_key_check = True
+        self.host_proxy = None
         self.client = None
+
+    def _setup_credentials(self):
+        if self.ssh_conn_id is not None:
+            conn = self.get_connection(self.ssh_conn_id)
+            if self.username is None:
+                self.username = conn.login
+            if self.password is None:
+                self.password = conn.password
+            if self.remote_host is None:
+                self.remote_host = conn.host
+            if self.remote_port is None:
+                self.remote_port = conn.port
+            if conn.extra is not None:
+                extra_options = conn.extra_dejson
+                self.key_file = extra_options.get("key_file")
+
+                if "timeout" in extra_options:
+                    self.timeout = int(extra_options["timeout"], 10)
+
+                if "compress" in extra_options \
+                        and extra_options["compress"].lower() == 'false':
+                    self.compress = False
+                if "no_host_key_check" in extra_options \
+                        and extra_options["no_host_key_check"].lower() == 'false':
+                    self.no_host_key_check = False
+
+        if not self.remote_host:
+            raise AirflowException("Missing required param: remote_host")
+
+        if not self.remote_port:
+            self.remote_port = 22
+
+        # Auto detecting username values from system
+        if not self.username:
+            self.log.debug(
+                "username to ssh to host: %s is not specified for connection id"
+                " %s. Using system's default provided by getpass.getuser()",
+                self.remote_host, self.ssh_conn_id
+            )
+            self.username = getpass.getuser()
+
+        user_ssh_config_filename = os.path.expanduser('~/.ssh/config')
+        if os.path.isfile(user_ssh_config_filename):
+            ssh_conf = paramiko.SSHConfig()
+            ssh_conf.parse(open(user_ssh_config_filename))
+            host_info = ssh_conf.lookup(self.remote_host)
+            if host_info and host_info.get('proxycommand'):
+                self.host_proxy = paramiko.ProxyCommand(host_info.get('proxycommand'))
+
+            if not (self.password or self.key_file):
+                if host_info and host_info.get('identityfile'):
+                    self.key_file = host_info.get('identityfile')[0]
 
     def get_conn(self):
         if not self.client:
             self.log.debug('Creating SSH client for conn_id: %s', self.ssh_conn_id)
-            if self.ssh_conn_id is not None:
-                conn = self.get_connection(self.ssh_conn_id)
-                if self.username is None:
-                    self.username = conn.login
-                if self.password is None:
-                    self.password = conn.password
-                if self.remote_host is None:
-                    self.remote_host = conn.host
-                if conn.extra is not None:
-                    extra_options = conn.extra_dejson
-                    self.key_file = extra_options.get("key_file")
 
-                    if "timeout" in extra_options:
-                        self.timeout = int(extra_options["timeout"], 10)
-
-                    if "compress" in extra_options \
-                            and extra_options["compress"].lower() == 'false':
-                        self.compress = False
-                    if "no_host_key_check" in extra_options \
-                            and extra_options["no_host_key_check"].lower() == 'false':
-                        self.no_host_key_check = False
-
-            if not self.remote_host:
-                raise AirflowException("Missing required param: remote_host")
-
-            # Auto detecting username values from system
-            if not self.username:
-                self.log.debug(
-                    "username to ssh to host: %s is not specified for connection id"
-                    " %s. Using system's default provided by getpass.getuser()",
-                    self.remote_host, self.ssh_conn_id
-                )
-                self.username = getpass.getuser()
-
-            host_proxy = None
-            user_ssh_config_filename = os.path.expanduser('~/.ssh/config')
-            if os.path.isfile(user_ssh_config_filename):
-                ssh_conf = paramiko.SSHConfig()
-                ssh_conf.parse(open(user_ssh_config_filename))
-                host_info = ssh_conf.lookup(self.remote_host)
-                if host_info and host_info.get('proxycommand'):
-                    host_proxy = paramiko.ProxyCommand(host_info.get('proxycommand'))
-
-                if not (self.password or self.key_file):
-                    if host_info and host_info.get('identityfile'):
-                        self.key_file = host_info.get('identityfile')[0]
+            self._setup_credentials()
 
             try:
                 client = paramiko.SSHClient()
@@ -131,86 +145,97 @@ class SSHHook(BaseHook, LoggingMixin):
 
                 if self.password and self.password.strip():
                     client.connect(hostname=self.remote_host,
+                                   port=self.remote_port,
                                    username=self.username,
                                    password=self.password,
                                    timeout=self.timeout,
                                    compress=self.compress,
-                                   sock=host_proxy)
+                                   sock=self.host_proxy)
                 else:
                     client.connect(hostname=self.remote_host,
+                                   port=self.remote_port,
                                    username=self.username,
                                    key_filename=self.key_file,
                                    timeout=self.timeout,
                                    compress=self.compress,
-                                   sock=host_proxy)
+                                   sock=self.host_proxy)
 
                 if self.keepalive_interval:
                     client.get_transport().set_keepalive(self.keepalive_interval)
 
                 self.client = client
             except paramiko.AuthenticationException as auth_error:
-                self.log.error(
-                    "Auth failed while connecting to host: %s, error: %s",
-                    self.remote_host, auth_error
-                )
+                self.log.exception("Auth failed while connecting to host: %s",
+                                   self.remote_host, auth_error)
             except paramiko.SSHException as ssh_error:
-                self.log.error(
-                    "Failed connecting to host: %s, error: %s",
-                    self.remote_host, ssh_error
-                )
+                self.log.exception("Failed connecting to host: %s",
+                                   self.remote_host)
             except Exception as error:
-                self.log.error(
-                    "Error connecting to host: %s, error: %s",
-                    self.remote_host, error
-                )
+                self.log.exception("Error connecting to host: %s",
+                                   self.remote_host)
+        else:
+            self.log.warning("SSH client already created for conn_id: %s", self.ssh_conn_id)
+
         return self.client
 
     @contextmanager
-    def create_tunnel(self, local_port, remote_port=None, remote_host="localhost"):
+    def create_tunnel(self, remote_host, remote_port, local_port=None):
         """
-        Creates a tunnel between two hosts. Like ssh -L <LOCAL_PORT>:host:<REMOTE_PORT>.
+        Creates a tunnel between two hosts, starting from the host to which we establish a ssh connection to. 
+        Similar to `ssh -L <LOCAL_PORT>:remote_host:<REMOTE_PORT>`.
         Remember to close() the returned "tunnel" object in order to clean up
         after yourself when you are done with the tunnel.
 
-        :param local_port:
-        :type local_port: int
-        :param remote_port:
-        :type remote_port: int
-        :param remote_host:
+        :param remote_host: The remote host to create a tunnel to
         :type remote_host: str
-        :return:
+        :param remote_port: The remote port to create a tunnel to
+        :type remote_port: int
+        :param local_port: Optionally specify local_port, use `client.local_bind_port` to 
+        retrieve the port if not specified.
+        :type local_port: int
+        :return: The created ssh tunnel
+        :rtype: sshtunnel.SSHTunnelForwarder
         """
 
-        import subprocess
-        # this will ensure the connection to the ssh.remote_host from where the tunnel
-        # is getting created
-        self.get_conn()
+        if not self.client or not self.client.is_active:
+            self.log.debug('Creating SSH tunnel for conn_id: %s', self.ssh_conn_id)
 
-        tunnel_host = "{0}:{1}:{2}".format(local_port, remote_host, remote_port)
+            self._setup_credentials()
 
-        ssh_cmd = ["ssh", "{0}@{1}".format(self.username, self.remote_host),
-                   "-o", "ControlMaster=no",
-                   "-o", "UserKnownHostsFile=/dev/null",
-                   "-o", "StrictHostKeyChecking=no"]
+            # always pass 127.0.0.1 to improve security
+            # sshtunnel binds to 0.0.0.0 by default, potentially exposing a service to the internet
+            if local_port:
+                local_bind_address = ('127.0.0.1', local_port)
+            else:
+                local_bind_address = ('127.0.0.1',)
 
-        ssh_tunnel_cmd = ["-L", tunnel_host,
-                          "echo -n ready && cat"
-                          ]
+            try:
+                if self.password and self.password.strip():
+                    client = sshtunnel.SSHTunnelForwarder(self.remote_host,
+                                                          ssh_port=self.remote_port,
+                                                          ssh_username=self.username,
+                                                          ssh_password=self.password,
+                                                          ssh_proxy=self.host_proxy,
+                                                          local_bind_address=local_bind_address,
+                                                          remote_bind_address=(remote_host, remote_port))
+                else:
+                    pkey = paramiko.RSAKey.from_private_key_file(self.key_file)
+                    client = sshtunnel.SSHTunnelForwarder(self.remote_host,
+                                                          ssh_port=self.remote_port,
+                                                          ssh_username=self.username,
+                                                          ssh_pkey=pkey,
+                                                          ssh_proxy=self.host_proxy,
+                                                          local_bind_address=local_bind_address,
+                                                          remote_bind_address=(remote_host, remote_port))
 
-        ssh_cmd += ssh_tunnel_cmd
-        self.log.debug("Creating tunnel with cmd: %s", ssh_cmd)
+                self.client = client
+            except sshtunnel.BaseSSHTunnelForwarderError as base_error:
+                self.log.exception("Error connecting to host: %s",
+                                   self.remote_host, base_error)
+        else:
+            self.log.warning("SSH tunnel already opened for conn_id: %s", self.ssh_conn_id)
 
-        proc = subprocess.Popen(ssh_cmd,
-                                stdin=subprocess.PIPE,
-                                stdout=subprocess.PIPE,
-                                close_fds=True)
-        ready = proc.stdout.read(5)
-        assert ready == b"ready", \
-            "Did not get 'ready' from remote, got '{0}' instead".format(ready)
-        yield
-        proc.communicate()
-        assert proc.returncode == 0, \
-            "Tunnel process did unclean exit (returncode {}".format(proc.returncode)
+        return self.client
 
     def __enter__(self):
         return self
@@ -218,3 +243,4 @@ class SSHHook(BaseHook, LoggingMixin):
     def __exit__(self, exc_type, exc_val, exc_tb):
         if self.client is not None:
             self.client.close()
+            self.client = None
